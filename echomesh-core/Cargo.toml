@@ -16,7 +16,7 @@ name = "test-connect"
 path = "src/bin/test-connect.rs"
 
 [features]
-default = ["native-ble"]
+default = []
 native-ble = ["dep:btleplug", "dep:ble-peripheral-rust"]
 
 [dependencies]
