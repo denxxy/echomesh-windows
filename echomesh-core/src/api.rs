@@ -8,9 +8,11 @@ use zeroize::Zeroize;
 
 use crate::client::actor::{register_relay_route, run_relay_actor};
 use crate::client::session::{ClientSessionManager, OutboundPacket};
+use crate::e2ee::{decrypt_direct, encrypt_for_peer};
 use crate::identity::ClientIdentity;
 use crate::model::{Contact, ConversationSummary, MessageRecord};
 use crate::storage::StorageManager;
+use crate::transport::{decode_direct_packet, encode_direct_packet};
 use crate::{CoreEventsListener, DeliveryStatus, EchoMeshError, MessagePayload, NetworkState};
 
 #[derive(uniffi::Object)]
@@ -30,20 +32,37 @@ pub struct EchoMeshClient {
 #[uniffi::export]
 impl EchoMeshClient {
     #[uniffi::constructor]
-    pub fn new(storage_path: String, listener: Box<dyn CoreEventsListener>) -> Result<Arc<Self>, EchoMeshError> {
+    pub fn new(
+        storage_path: String,
+        listener: Box<dyn CoreEventsListener>,
+    ) -> Result<Arc<Self>, EchoMeshError> {
         let storage_dir = std::path::Path::new(&storage_path);
-        std::fs::create_dir_all(storage_dir).map_err(|e| EchoMeshError::StorageError(format!("create storage directory: {e}")))?;
+        std::fs::create_dir_all(storage_dir)
+            .map_err(|e| EchoMeshError::StorageError(format!("create storage directory: {e}")))?;
+
         let identity = Arc::new(ClientIdentity::load_or_generate(storage_dir)?);
         let mut database_key = identity.database_key();
-        let storage_result = StorageManager::new_encrypted(storage_dir.join("echomesh.db"), &database_key);
+        let db_path = storage_dir.join("echomesh.db");
+        let storage_result = StorageManager::new_encrypted(&db_path, &database_key);
         database_key.zeroize();
         let storage = Arc::new(storage_result?);
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
             .map_err(|e| EchoMeshError::RuntimeError(e.to_string()))?;
+
         Ok(Arc::new(Self {
-            storage_path, storage, identity, listener: Arc::from(listener),
-            state: Arc::new(RwLock::new(NetworkState::Offline)), ping_ms: AtomicU32::new(0), runtime: Arc::new(runtime),
-            shutdown_sender: Mutex::new(None), connection_generation: Arc::new(AtomicU64::new(0)),
+            storage_path,
+            storage,
+            identity,
+            listener: Arc::from(listener),
+            state: Arc::new(RwLock::new(NetworkState::Offline)),
+            ping_ms: AtomicU32::new(0),
+            runtime: Arc::new(runtime),
+            shutdown_sender: Mutex::new(None),
+            connection_generation: Arc::new(AtomicU64::new(0)),
             session_mgr: Arc::new(ClientSessionManager::new()),
         }))
     }
@@ -56,6 +75,35 @@ impl EchoMeshClient {
 
     pub fn send_packet(&self, recipient: Vec<u8>, data: Vec<u8>) -> Result<(), EchoMeshError> {
         self.session_mgr.send_packet(recipient, data)
+    }
+
+    pub fn build_direct_packet(&self, recipient: Vec<u8>, data: Vec<u8>) -> Result<Vec<u8>, EchoMeshError> {
+        let recipient: [u8; 32] = recipient.as_slice().try_into().map_err(|_| EchoMeshError::InvalidKeyLength {
+            expected: 32,
+            actual: recipient.len() as u32,
+        })?;
+        let envelope = encrypt_for_peer(&self.identity, &recipient, &data)?;
+        encode_direct_packet(&envelope)
+    }
+
+    pub fn receive_direct_packet(&self, packet: Vec<u8>) -> Result<(), EchoMeshError> {
+        let envelope = decode_direct_packet(&packet)?;
+        let decrypted = decrypt_direct(&self.identity, envelope)?;
+        let text = String::from_utf8(decrypted.plaintext.clone()).unwrap_or_else(|_| "[binary encrypted message]".to_string());
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let message = MessageRecord {
+            id: format!("direct_{}_{}", now, rand::random::<u16>()),
+            conversation_peer_id: decrypted.sender_peer_id.to_vec(),
+            sender_peer_id: decrypted.sender_peer_id.to_vec(),
+            text,
+            timestamp: now,
+            is_outgoing: false,
+            status: 1,
+        };
+        self.storage.save_message(&message)?;
+        self.listener.on_message_received(message);
+        self.listener.on_packet_received(decrypted.sender_peer_id.to_vec(), decrypted.plaintext);
+        Ok(())
     }
 
     pub fn connect(&self, relay_address: String, relay_public_key: Vec<u8>, secret_token_hex: Option<String>) -> Result<(), EchoMeshError> {
