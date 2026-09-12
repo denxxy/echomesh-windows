@@ -1,8 +1,9 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::e2ee::{decrypt_direct, encrypt_for_peer};
 use crate::identity::ClientIdentity;
+use crate::transport::ble::{fragment_packet, BleReassembler};
 use crate::transport::direct::{decode_direct_packet, encode_direct_packet};
 use crate::EchoMeshError;
 
@@ -15,6 +16,7 @@ pub struct DirectMessage {
 #[derive(uniffi::Object)]
 pub struct DirectTransportCrypto {
     identity: Arc<ClientIdentity>,
+    ble_reassembler: Mutex<BleReassembler>,
 }
 
 #[uniffi::export]
@@ -22,7 +24,10 @@ impl DirectTransportCrypto {
     #[uniffi::constructor]
     pub fn new(storage_path: String) -> Result<Arc<Self>, EchoMeshError> {
         let identity = ClientIdentity::load_or_generate(Path::new(&storage_path))?;
-        Ok(Arc::new(Self { identity: Arc::new(identity) }))
+        Ok(Arc::new(Self {
+            identity: Arc::new(identity),
+            ble_reassembler: Mutex::new(BleReassembler::new()),
+        }))
     }
 
     pub fn local_peer_id(&self) -> Vec<u8> {
@@ -45,6 +50,32 @@ impl DirectTransportCrypto {
             sender_peer_id: decrypted.sender_peer_id.to_vec(),
             data: decrypted.plaintext,
         })
+    }
+
+    pub fn ble_fragments(
+        &self,
+        packet: Vec<u8>,
+        mtu: u32,
+        message_id: u32,
+    ) -> Result<Vec<Vec<u8>>, EchoMeshError> {
+        fragment_packet(&packet, mtu as usize, message_id)
+    }
+
+    pub fn open_ble_fragment(&self, fragment: Vec<u8>) -> Result<Option<DirectMessage>, EchoMeshError> {
+        let packet = self
+            .ble_reassembler
+            .lock()
+            .map_err(|_| EchoMeshError::RuntimeError("BLE reassembler lock poisoned".to_string()))?
+            .push(&fragment)?;
+        packet.map(|packet| self.open(packet)).transpose()
+    }
+
+    pub fn reset_ble_reassembly(&self) -> Result<(), EchoMeshError> {
+        self.ble_reassembler
+            .lock()
+            .map_err(|_| EchoMeshError::RuntimeError("BLE reassembler lock poisoned".to_string()))?
+            .clear();
+        Ok(())
     }
 }
 
