@@ -14,7 +14,7 @@ use crate::identity::ClientIdentity;
 use crate::model::MessageRecord;
 use crate::noise::{NoiseSession, ENCRYPTED_FRAME_SIZE};
 use crate::protocol::{Frame, ECHO_SERVICE_PEER_ID};
-use crate::route::{peer_route_id, registration_ack_route, registration_frame};
+use crate::route::{peer_route_id, registration_ack_route, registration_frame, ROUTER_CONTROL_ID};
 use crate::storage::StorageManager;
 use crate::{CoreEventsListener, EchoMeshError};
 
@@ -89,7 +89,8 @@ async fn send_outbound_packet(
             .map_err(|e| EchoMeshError::ConnectionError(format!("frame encoding: {e}")))?
     } else {
         let recipient: [u8; 32] = packet.recipient.as_slice().try_into().map_err(|_| EchoMeshError::InvalidKeyLength {
-            expected: 32, actual: packet.recipient.len() as u32,
+            expected: 32,
+            actual: packet.recipient.len() as u32,
         })?;
         let encrypted = encrypt_for_peer(identity, &recipient, &packet.data)?;
         Frame::new(peer_route_id(&recipient), nonce, bytes::Bytes::from(encrypted))
@@ -107,11 +108,19 @@ fn handle_incoming_frame(
     listener: &Arc<dyn CoreEventsListener>,
     frame: Frame,
 ) -> Result<(), EchoMeshError> {
-    if let Some(route) = registration_ack_route(&frame) {
-        if route == identity.route_id() { debug!("relay route registration acknowledged"); }
-        else { warn!("relay returned a mismatched route acknowledgement"); }
+    if frame.session_id == ROUTER_CONTROL_ID {
+        if let Some(route) = registration_ack_route(&frame) {
+            if route == identity.route_id() {
+                debug!("relay route registration acknowledged");
+            } else {
+                warn!("relay returned a mismatched route acknowledgement");
+            }
+        } else {
+            debug!("ignoring unsupported relay control frame");
+        }
         return Ok(());
     }
+
     let (sender_peer_id, plaintext) = if frame.session_id == ECHO_SERVICE_PEER_ID[..16] {
         (ECHO_SERVICE_PEER_ID, frame.payload.to_vec())
     } else {
@@ -122,8 +131,12 @@ fn handle_incoming_frame(
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let message = MessageRecord {
         id: format!("msg_{}_{}", now, rand::random::<u16>()),
-        conversation_peer_id: sender_peer_id.to_vec(), sender_peer_id: sender_peer_id.to_vec(), text,
-        timestamp: now, is_outgoing: false, status: 1,
+        conversation_peer_id: sender_peer_id.to_vec(),
+        sender_peer_id: sender_peer_id.to_vec(),
+        text,
+        timestamp: now,
+        is_outgoing: false,
+        status: 1,
     };
     storage.save_message(&message)?;
     listener.on_message_received(message);
@@ -156,5 +169,14 @@ mod tests {
         let messages = storage.get_messages(&alice.public_key(), 10, 0).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "hello");
+    }
+
+    #[test]
+    fn legacy_echoed_route_registration_is_ignored() {
+        let identity = ClientIdentity::from_secret([7u8; 32]);
+        let storage = StorageManager::new_in_memory().unwrap();
+        let listener: Arc<dyn CoreEventsListener> = Arc::new(Sink);
+        let frame = registration_frame(identity.route_id());
+        handle_incoming_frame(&identity, &storage, &listener, frame).unwrap();
     }
 }
