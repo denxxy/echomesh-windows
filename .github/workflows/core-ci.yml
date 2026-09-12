@@ -26,3 +26,12 @@ jobs:
         run: cargo check --all-targets
       - name: Unit and interoperability tests
         run: cargo test --all-targets
+
+  windows-shell:
+    name: windows-tauri-shell
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile Windows application shell
+        run: cargo check --manifest-path src-tauri/Cargo.toml
