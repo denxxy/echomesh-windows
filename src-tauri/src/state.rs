@@ -25,7 +25,7 @@ pub struct MessageDto {
     pub text: String,
     pub timestamp: u64,
     pub is_outgoing: bool,
-    pub status: u8, // 0 = Sending, 1 = Sent, 2 = Failed
+    pub status: u8,
 }
 
 impl From<MessageRecord> for MessageDto {
@@ -72,7 +72,7 @@ pub struct RelayStatusDto {
     pub public_key_hex: String,
 }
 
-/// Global Application State kept in Tauri
+/// Global Application State kept in Tauri.
 pub struct AppState {
     pub client: RwLock<Option<Arc<EchoMeshClient>>>,
     pub connection_status: AtomicU8,
@@ -84,21 +84,36 @@ impl AppState {
     pub fn new(storage_path: PathBuf) -> Self {
         Self {
             client: RwLock::new(None),
-            connection_status: AtomicU8::new(0), // 0 = Offline
+            connection_status: AtomicU8::new(0),
             current_relay: RwLock::new(None),
             storage_path,
         }
     }
 
     pub fn set_status(&self, status: NetworkState) -> u8 {
-        let code = match status {
-            NetworkState::Offline => 0,
-            NetworkState::Connecting => 1,
-            NetworkState::ConnectedRealityRelay => 2,
-            NetworkState::ConnectedBleMeshFallback => 3,
-        };
+        let code = network_state_code(status);
         self.connection_status.store(code, Ordering::SeqCst);
         code
+    }
+}
+
+fn network_state_code(state: NetworkState) -> u8 {
+    match state {
+        NetworkState::Offline => 0,
+        NetworkState::Connecting => 1,
+        NetworkState::ConnectedRealityRelay => 2,
+        NetworkState::ConnectedLan => 3,
+        NetworkState::ConnectedBleMeshFallback => 4,
+    }
+}
+
+fn network_state_text(state: NetworkState) -> &'static str {
+    match state {
+        NetworkState::Offline => "Offline",
+        NetworkState::Connecting => "Connecting",
+        NetworkState::ConnectedRealityRelay => "Connected",
+        NetworkState::ConnectedLan => "LAN Direct",
+        NetworkState::ConnectedBleMeshFallback => "BLE Mesh",
     }
 }
 
@@ -110,26 +125,14 @@ pub struct TauriEventsListener {
 
 impl CoreEventsListener for TauriEventsListener {
     fn on_state_changed(&self, state: NetworkState) {
-        let code = match state {
-            NetworkState::Offline => 0,
-            NetworkState::Connecting => 1,
-            NetworkState::ConnectedRealityRelay => 2,
-            NetworkState::ConnectedBleMeshFallback => 3,
-        };
+        let code = network_state_code(state);
         self.status_ref.store(code, Ordering::SeqCst);
-
-        let status_text = match state {
-            NetworkState::Offline => "Offline",
-            NetworkState::Connecting => "Connecting",
-            NetworkState::ConnectedRealityRelay => "Connected",
-            NetworkState::ConnectedBleMeshFallback => "BLE Mesh",
-        };
 
         let _ = self.app_handle.emit(
             "connection-status-changed",
             serde_json::json!({
                 "status": code,
-                "status_text": status_text,
+                "status_text": network_state_text(state),
             }),
         );
     }
@@ -138,7 +141,6 @@ impl CoreEventsListener for TauriEventsListener {
         let dto = MessageDto::from(message.clone());
         let _ = self.app_handle.emit("new-message", &dto);
 
-        // Native Windows notification when incoming message arrives
         if !message.is_outgoing {
             let _ = self
                 .app_handle
@@ -178,7 +180,6 @@ impl CoreEventsListener for TauriEventsListener {
     }
 }
 
-/// Resolves the storage directory in %APPDATA%/EchoMesh on Windows.
 pub fn get_app_data_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -198,4 +199,18 @@ pub fn get_app_data_path() -> PathBuf {
     let path = PathBuf::from("./data/EchoMesh");
     let _ = std::fs::create_dir_all(&path);
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_network_states_have_stable_ui_codes() {
+        assert_eq!(network_state_code(NetworkState::Offline), 0);
+        assert_eq!(network_state_code(NetworkState::Connecting), 1);
+        assert_eq!(network_state_code(NetworkState::ConnectedRealityRelay), 2);
+        assert_eq!(network_state_code(NetworkState::ConnectedLan), 3);
+        assert_eq!(network_state_code(NetworkState::ConnectedBleMeshFallback), 4);
+    }
 }
