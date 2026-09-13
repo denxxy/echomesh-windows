@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::RngCore;
+
 use crate::client::session::{ClientSessionManager, OutboundPacket};
 use crate::crypto::IdentityKeyPair;
 use crate::model::{Contact, ConversationSummary, MessageRecord};
@@ -10,6 +11,7 @@ use crate::storage::StorageManager;
 use crate::{CoreEventsListener, DeliveryStatus, EchoMeshError, MessagePayload, NetworkState};
 
 const ROUTE_REGISTRATION_ID: [u8; 16] = [0xF0; 16];
+const ECHO_ROUTE_ID: [u8; 16] = [0xEE; 16];
 
 #[derive(uniffi::Object)]
 pub struct EchoMeshClient {
@@ -33,7 +35,7 @@ impl EchoMeshClient {
         let root = std::path::Path::new(&storage_path);
         let storage = Arc::new(StorageManager::new(root.join("echomesh.db"))?);
         let identity = crate::crypto::load_or_generate_identity(&root.join("identity.key"))?;
-        let runtime = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| EchoMeshError::RuntimeError(e.to_string()))?);
+        let runtime = crate::runtime::shared_runtime()?;
         let (tx, _) = tokio::sync::broadcast::channel::<()>(4);
         Ok(Arc::new(Self { storage_path, storage, identity, listener: Arc::from(listener), state: Arc::new(RwLock::new(NetworkState::Offline)), ping_ms: AtomicU32::new(0), runtime, shutdown_sender: Mutex::new(Some(tx)), session_mgr: Arc::new(ClientSessionManager::new()), outbound_tx: Arc::new(RwLock::new(None)) }))
     }
@@ -73,7 +75,7 @@ impl EchoMeshClient {
     fn start_relay_workers(&self,tcp_stream:tokio::net::TcpStream,session:crate::noise::NoiseSession){
         let(mut read_half,mut write_half)=tcp_stream.into_split();let(outbound_tx,mut outbound_rx)=tokio::sync::mpsc::channel::<OutboundPacket>(256);*self.outbound_tx.write().unwrap()=Some(outbound_tx.clone());let session=Arc::new(tokio::sync::Mutex::new(session));self.session_mgr.set_transport(session.clone(),outbound_tx);
         let mut shutdown_out=self.shutdown_sender.lock().unwrap().as_ref().map(|tx|tx.subscribe());let session_out=session.clone();self.runtime.spawn(async move{use tokio::io::AsyncWriteExt;loop{tokio::select!{msg=outbound_rx.recv()=>{let Some(pkt)=msg else{break};let mut route=[0u8;16];if pkt.recipient==crate::protocol::ECHO_SERVICE_PEER_ID{route.copy_from_slice(&crate::protocol::ECHO_SERVICE_PEER_ID[..16]);}else{if pkt.recipient.len()!=32{tracing::warn!("refusing packet with non-32-byte peer key");continue;}route.copy_from_slice(&pkt.recipient[..16]);}let payload=if pkt.recipient==crate::protocol::ECHO_SERVICE_PEER_ID{pkt.data}else{match crate::e2ee::encrypt_for_peer(&pkt.recipient,&pkt.data){Ok(v)=>v,Err(e)=>{tracing::warn!("E2EE encrypt failed: {}",e);continue;}}};let mut nonce=[0u8;8];rand::thread_rng().fill_bytes(&mut nonce);let frame=match crate::protocol::Frame::new(route,nonce,bytes::Bytes::from(payload)){Ok(f)=>f,Err(e)=>{tracing::warn!("frame construction failed: {}",e);continue;}};let packet={let mut s=session_out.lock().await;s.encrypt_frame(&frame)};let Ok(packet)=packet else{break};if write_half.write_all(&packet).await.is_err()||write_half.flush().await.is_err(){break;}}_=async{if let Some(rx)=shutdown_out.as_mut(){let _=rx.recv().await;}else{std::future::pending::<()>().await}}=>break,}}});
-        let listener=self.listener.clone();let storage=self.storage.clone();let local_private=self.identity.private_key.clone();let state=self.state.clone();let outbound_ref=self.outbound_tx.clone();let session_mgr=self.session_mgr.clone();let session_in=session.clone();let mut shutdown_in=self.shutdown_sender.lock().unwrap().as_ref().map(|tx|tx.subscribe());self.runtime.spawn(async move{loop{tokio::select!{result=read_encrypted_frame(&mut read_half,session_in.clone())=>{let frame=match result{Ok(Some(f))=>f,Ok(None)=>break,Err(e)=>{tracing::warn!("inbound frame failed: {}",e);break;}};let is_echo=frame.session_id==crate::protocol::ECHO_SERVICE_PEER_ID[..16];let plaintext=if is_echo{frame.payload.to_vec()}else{match crate::e2ee::decrypt_from_peer(&local_private,&frame.payload){Ok(v)=>v,Err(e)=>{tracing::warn!("dropping unauthenticated E2EE payload: {}",e);continue;}}};let sender=if is_echo{crate::protocol::ECHO_SERVICE_PEER_ID.to_vec()}else{resolve_sender(&storage,&frame.session_id)};let text=String::from_utf8(plaintext.clone()).unwrap_or_else(|_|hex::encode(&plaintext));let record=MessageRecord{id:format!("msg_{}_{}",now_millis(),rand::random::<u16>()),conversation_peer_id:sender.clone(),sender_peer_id:sender.clone(),text,timestamp:now_millis(),is_outgoing:false,status:1};let _=storage.save_message(&record);listener.on_message_received(record);listener.on_packet_received(sender,plaintext);}_=async{if let Some(rx)=shutdown_in.as_mut(){let _=rx.recv().await;}else{std::future::pending::<()>().await}}=>break,}}*outbound_ref.write().unwrap()=None;session_mgr.disconnect();*state.write().unwrap()=NetworkState::Offline;listener.on_state_changed(NetworkState::Offline);});
+        let listener=self.listener.clone();let storage=self.storage.clone();let local_private=self.identity.private_key.clone();let state=self.state.clone();let outbound_ref=self.outbound_tx.clone();let session_mgr=self.session_mgr.clone();let session_in=session.clone();let mut shutdown_in=self.shutdown_sender.lock().unwrap().as_ref().map(|tx|tx.subscribe());self.runtime.spawn(async move{loop{tokio::select!{result=read_encrypted_frame(&mut read_half,session_in.clone())=>{let frame=match result{Ok(Some(f))=>f,Ok(None)=>break,Err(e)=>{tracing::warn!("inbound frame failed: {}",e);break;}};let is_echo=frame.session_id==ECHO_ROUTE_ID;let plaintext=if is_echo{frame.payload.to_vec()}else{match crate::e2ee::decrypt_from_peer(&local_private,&frame.payload){Ok(v)=>v,Err(e)=>{tracing::warn!("dropping unauthenticated E2EE payload: {}",e);continue;}}};let sender=if is_echo{crate::protocol::ECHO_SERVICE_PEER_ID.to_vec()}else{resolve_sender(&storage,&frame.session_id)};let text=String::from_utf8(plaintext.clone()).unwrap_or_else(|_|hex::encode(&plaintext));let record=MessageRecord{id:format!("msg_{}_{}",now_millis(),rand::random::<u16>()),conversation_peer_id:sender.clone(),sender_peer_id:sender.clone(),text,timestamp:now_millis(),is_outgoing:false,status:1};let _=storage.save_message(&record);listener.on_message_received(record);listener.on_packet_received(sender,plaintext);}_=async{if let Some(rx)=shutdown_in.as_mut(){let _=rx.recv().await;}else{std::future::pending::<()>().await}}=>break,}}*outbound_ref.write().unwrap()=None;session_mgr.disconnect();*state.write().unwrap()=NetworkState::Offline;listener.on_state_changed(NetworkState::Offline);});
     }
 }
 
