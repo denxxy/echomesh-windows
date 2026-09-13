@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
+use echomesh_core::transport::ble_native::NativeBleTransport;
 use echomesh_core::{
     Contact, CoreEventsListener, DeliveryStatus, EchoMeshClient, MessageRecord, NetworkState,
 };
@@ -78,6 +79,8 @@ pub struct AppState {
     pub connection_status: AtomicU8,
     pub current_relay: RwLock<Option<RelayInfo>>,
     pub storage_path: PathBuf,
+    ble: Mutex<Option<Arc<NativeBleTransport>>>,
+    ble_receive_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -87,6 +90,8 @@ impl AppState {
             connection_status: AtomicU8::new(0),
             current_relay: RwLock::new(None),
             storage_path,
+            ble: Mutex::new(None),
+            ble_receive_task: Mutex::new(None),
         }
     }
 
@@ -94,6 +99,52 @@ impl AppState {
         let code = network_state_code(status);
         self.connection_status.store(code, Ordering::SeqCst);
         code
+    }
+
+    /// Starts one shared BLE bearer for the application's primary EchoMesh client.
+    /// Incoming EMD1 packets are handed back to that same client so E2EE
+    /// authentication, SQLCipher persistence and UI events follow the exact same
+    /// path as relay/LAN traffic.
+    pub async fn ensure_ble(
+        &self,
+        client: Arc<EchoMeshClient>,
+    ) -> Result<Arc<NativeBleTransport>, String> {
+        let mut ble_guard = self.ble.lock().await;
+        if let Some(transport) = ble_guard.as_ref() {
+            return Ok(transport.clone());
+        }
+
+        let local_peer_id: [u8; 32] = client
+            .local_peer_id()
+            .as_slice()
+            .try_into()
+            .map_err(|_| "EchoMesh local identity has invalid length".to_string())?;
+        let transport = NativeBleTransport::start(local_peer_id)
+            .await
+            .map_err(|e| format!("Failed to start native BLE transport: {e}"))?;
+
+        let receiver = transport.clone();
+        let receive_client = client.clone();
+        let task = tokio::spawn(async move {
+            while let Some(packet) = receiver.recv_packet().await {
+                if let Err(error) = receive_client.receive_direct_packet(packet) {
+                    tracing::warn!(error = %error, "dropping invalid BLE direct packet");
+                }
+            }
+        });
+
+        if let Some(old_task) = self.ble_receive_task.lock().await.replace(task) {
+            old_task.abort();
+        }
+        *ble_guard = Some(transport.clone());
+        Ok(transport)
+    }
+
+    pub async fn stop_ble(&self) {
+        if let Some(task) = self.ble_receive_task.lock().await.take() {
+            task.abort();
+        }
+        self.ble.lock().await.take();
     }
 }
 
