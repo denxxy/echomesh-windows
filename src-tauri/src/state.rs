@@ -5,7 +5,6 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::RwLock;
 
-use echomesh_core::transport::{encode_direct_packet, NativeBleTransport};
 use echomesh_core::{
     Contact, CoreEventsListener, DeliveryStatus, EchoMeshClient, MessageRecord, NetworkState,
 };
@@ -76,7 +75,6 @@ pub struct RelayStatusDto {
 /// Global Application State kept in Tauri.
 pub struct AppState {
     pub client: RwLock<Option<Arc<EchoMeshClient>>>,
-    pub ble_transport: RwLock<Option<Arc<NativeBleTransport>>>,
     pub connection_status: AtomicU8,
     pub current_relay: RwLock<Option<RelayInfo>>,
     pub storage_path: PathBuf,
@@ -86,7 +84,6 @@ impl AppState {
     pub fn new(storage_path: PathBuf) -> Self {
         Self {
             client: RwLock::new(None),
-            ble_transport: RwLock::new(None),
             connection_status: AtomicU8::new(0),
             current_relay: RwLock::new(None),
             storage_path,
@@ -97,52 +94,6 @@ impl AppState {
         let code = network_state_code(status);
         self.connection_status.store(code, Ordering::SeqCst);
         code
-    }
-
-    /// Starts the native WinRT GATT bearer once. Complete BLE envelopes are
-    /// wrapped back into EMD1 and handed to the same core direct receive path
-    /// used by LAN, so signature/decryption/storage behavior cannot diverge.
-    pub async fn ensure_ble(
-        &self,
-        client: Arc<EchoMeshClient>,
-    ) -> Result<Arc<NativeBleTransport>, String> {
-        if let Some(existing) = self.ble_transport.read().await.as_ref().cloned() {
-            return Ok(existing);
-        }
-
-        let local_peer_id: [u8; 32] = client
-            .local_peer_id()
-            .as_slice()
-            .try_into()
-            .map_err(|_| "Core returned an invalid local peer identity".to_string())?;
-        let transport = NativeBleTransport::start(local_peer_id)
-            .await
-            .map_err(|e| format!("Failed to start native BLE transport: {e}"))?;
-
-        let mut guard = self.ble_transport.write().await;
-        if let Some(existing) = guard.as_ref().cloned() {
-            return Ok(existing);
-        }
-        *guard = Some(transport.clone());
-        drop(guard);
-
-        let receiver = transport.clone();
-        tokio::spawn(async move {
-            while let Some(envelope) = receiver.recv_envelope().await {
-                match encode_direct_packet(&envelope) {
-                    Ok(packet) => {
-                        if let Err(error) = client.receive_direct_packet(packet) {
-                            tracing::warn!(error = %error, "rejected inbound BLE packet");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "rejected oversized BLE envelope");
-                    }
-                }
-            }
-        });
-
-        Ok(transport)
     }
 }
 
