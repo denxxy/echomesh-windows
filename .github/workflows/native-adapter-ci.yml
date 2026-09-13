@@ -1,0 +1,18 @@
+name: Native Adapter CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: windows-native-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-app:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check Tauri backend with native BLE
+        run: cargo check --manifest-path src-tauri/Cargo.toml
