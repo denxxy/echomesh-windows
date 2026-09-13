@@ -16,14 +16,13 @@ pub fn run() {
         .try_init();
 
     let storage_path = get_app_data_path();
-    tracing::info!("EchoMesh storage path: {:?}", storage_path);
+    tracing::info!("EchoMesh local storage initialized");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::new(storage_path))
         .setup(|app| {
-            // Build Tray Icon Menu
             let open_i = MenuItem::with_id(app, "open", "Открыть EchoMesh", true, None::<&str>)?;
             let status_i = MenuItem::with_id(app, "status", "Статус: Отключен", false, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
@@ -74,11 +73,9 @@ pub fn run() {
             }
 
             tray_builder.build(app)?;
-
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Minimize to system tray on window close button
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
@@ -92,6 +89,8 @@ pub fn run() {
             commands::add_contact,
             commands::send_message,
             commands::get_history,
+            commands::start_ble_mesh,
+            commands::send_ble_packet,
         ])
         .run(tauri::generate_context!())
         .expect("error while running echomesh tauri application");

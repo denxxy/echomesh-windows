@@ -5,7 +5,10 @@ use echomesh_core::protocol::ECHO_SERVICE_PEER_ID;
 use echomesh_core::EchoMeshClient;
 use crate::state::{AppState, MessageDto, TauriEventsListener};
 
-async fn ensure_client(app_handle: &AppHandle, state: &State<'_, AppState>) -> Result<Arc<EchoMeshClient>, String> {
+pub(crate) async fn ensure_client(
+    app_handle: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<Arc<EchoMeshClient>, String> {
     let mut client_guard = state.client.write().await;
     if client_guard.is_none() {
         let storage_str = state.storage_path.to_string_lossy().to_string();
@@ -18,11 +21,10 @@ async fn ensure_client(app_handle: &AppHandle, state: &State<'_, AppState>) -> R
 
         let client = EchoMeshClient::new(storage_str, listener)
             .map_err(|e| format!("Failed to create EchoMeshClient: {:?}", e))?;
-        *client_guard = Some(client.clone());
-        Ok(client)
-    } else {
-        Ok(client_guard.as_ref().unwrap().clone())
+        *client_guard = Some(client);
     }
+
+    Ok(client_guard.as_ref().unwrap().clone())
 }
 
 #[tauri::command]

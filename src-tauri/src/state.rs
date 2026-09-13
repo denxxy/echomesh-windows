@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
+use echomesh_core::transport::ble_native::NativeBleTransport;
 use echomesh_core::{
     Contact, CoreEventsListener, DeliveryStatus, EchoMeshClient, MessageRecord, NetworkState,
 };
@@ -25,7 +26,7 @@ pub struct MessageDto {
     pub text: String,
     pub timestamp: u64,
     pub is_outgoing: bool,
-    pub status: u8, // 0 = Sending, 1 = Sent, 2 = Failed
+    pub status: u8,
 }
 
 impl From<MessageRecord> for MessageDto {
@@ -72,33 +73,98 @@ pub struct RelayStatusDto {
     pub public_key_hex: String,
 }
 
-/// Global Application State kept in Tauri
+/// Global Application State kept in Tauri.
 pub struct AppState {
     pub client: RwLock<Option<Arc<EchoMeshClient>>>,
     pub connection_status: AtomicU8,
     pub current_relay: RwLock<Option<RelayInfo>>,
     pub storage_path: PathBuf,
+    ble: Mutex<Option<Arc<NativeBleTransport>>>,
+    ble_receive_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
     pub fn new(storage_path: PathBuf) -> Self {
         Self {
             client: RwLock::new(None),
-            connection_status: AtomicU8::new(0), // 0 = Offline
+            connection_status: AtomicU8::new(0),
             current_relay: RwLock::new(None),
             storage_path,
+            ble: Mutex::new(None),
+            ble_receive_task: Mutex::new(None),
         }
     }
 
     pub fn set_status(&self, status: NetworkState) -> u8 {
-        let code = match status {
-            NetworkState::Offline => 0,
-            NetworkState::Connecting => 1,
-            NetworkState::ConnectedRealityRelay => 2,
-            NetworkState::ConnectedBleMeshFallback => 3,
-        };
+        let code = network_state_code(status);
         self.connection_status.store(code, Ordering::SeqCst);
         code
+    }
+
+    /// Starts one shared BLE bearer for the application's primary EchoMesh client.
+    /// Incoming EMD1 packets are handed back to that same client so E2EE
+    /// authentication, SQLCipher persistence and UI events follow the exact same
+    /// path as relay/LAN traffic.
+    pub async fn ensure_ble(
+        &self,
+        client: Arc<EchoMeshClient>,
+    ) -> Result<Arc<NativeBleTransport>, String> {
+        let mut ble_guard = self.ble.lock().await;
+        if let Some(transport) = ble_guard.as_ref() {
+            return Ok(transport.clone());
+        }
+
+        let local_peer_id: [u8; 32] = client
+            .local_peer_id()
+            .as_slice()
+            .try_into()
+            .map_err(|_| "EchoMesh local identity has invalid length".to_string())?;
+        let transport = NativeBleTransport::start(local_peer_id)
+            .await
+            .map_err(|e| format!("Failed to start native BLE transport: {e}"))?;
+
+        let receiver = transport.clone();
+        let receive_client = client.clone();
+        let task = tokio::spawn(async move {
+            while let Some(packet) = receiver.recv_packet().await {
+                if let Err(error) = receive_client.receive_direct_packet(packet) {
+                    tracing::warn!(error = %error, "dropping invalid BLE direct packet");
+                }
+            }
+        });
+
+        if let Some(old_task) = self.ble_receive_task.lock().await.replace(task) {
+            old_task.abort();
+        }
+        *ble_guard = Some(transport.clone());
+        Ok(transport)
+    }
+
+    pub async fn stop_ble(&self) {
+        if let Some(task) = self.ble_receive_task.lock().await.take() {
+            task.abort();
+        }
+        self.ble.lock().await.take();
+    }
+}
+
+fn network_state_code(state: NetworkState) -> u8 {
+    match state {
+        NetworkState::Offline => 0,
+        NetworkState::Connecting => 1,
+        NetworkState::ConnectedRealityRelay => 2,
+        NetworkState::ConnectedLan => 3,
+        NetworkState::ConnectedBleMeshFallback => 4,
+    }
+}
+
+fn network_state_text(state: NetworkState) -> &'static str {
+    match state {
+        NetworkState::Offline => "Offline",
+        NetworkState::Connecting => "Connecting",
+        NetworkState::ConnectedRealityRelay => "Connected",
+        NetworkState::ConnectedLan => "LAN Direct",
+        NetworkState::ConnectedBleMeshFallback => "BLE Mesh",
     }
 }
 
@@ -110,26 +176,14 @@ pub struct TauriEventsListener {
 
 impl CoreEventsListener for TauriEventsListener {
     fn on_state_changed(&self, state: NetworkState) {
-        let code = match state {
-            NetworkState::Offline => 0,
-            NetworkState::Connecting => 1,
-            NetworkState::ConnectedRealityRelay => 2,
-            NetworkState::ConnectedBleMeshFallback => 3,
-        };
+        let code = network_state_code(state);
         self.status_ref.store(code, Ordering::SeqCst);
-
-        let status_text = match state {
-            NetworkState::Offline => "Offline",
-            NetworkState::Connecting => "Connecting",
-            NetworkState::ConnectedRealityRelay => "Connected",
-            NetworkState::ConnectedBleMeshFallback => "BLE Mesh",
-        };
 
         let _ = self.app_handle.emit(
             "connection-status-changed",
             serde_json::json!({
                 "status": code,
-                "status_text": status_text,
+                "status_text": network_state_text(state),
             }),
         );
     }
@@ -138,7 +192,6 @@ impl CoreEventsListener for TauriEventsListener {
         let dto = MessageDto::from(message.clone());
         let _ = self.app_handle.emit("new-message", &dto);
 
-        // Native Windows notification when incoming message arrives
         if !message.is_outgoing {
             let _ = self
                 .app_handle
@@ -178,7 +231,6 @@ impl CoreEventsListener for TauriEventsListener {
     }
 }
 
-/// Resolves the storage directory in %APPDATA%/EchoMesh on Windows.
 pub fn get_app_data_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -198,4 +250,18 @@ pub fn get_app_data_path() -> PathBuf {
     let path = PathBuf::from("./data/EchoMesh");
     let _ = std::fs::create_dir_all(&path);
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_network_states_have_stable_ui_codes() {
+        assert_eq!(network_state_code(NetworkState::Offline), 0);
+        assert_eq!(network_state_code(NetworkState::Connecting), 1);
+        assert_eq!(network_state_code(NetworkState::ConnectedRealityRelay), 2);
+        assert_eq!(network_state_code(NetworkState::ConnectedLan), 3);
+        assert_eq!(network_state_code(NetworkState::ConnectedBleMeshFallback), 4);
+    }
 }
