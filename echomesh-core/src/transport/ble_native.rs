@@ -45,6 +45,13 @@ impl NativeBleTransport {
     }
 }
 
+impl Drop for NativeBleTransport {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "native-ble", any(target_os = "macos", target_os = "windows")))]
+        self._server_task.abort();
+    }
+}
+
 #[cfg(all(feature = "native-ble", any(target_os = "macos", target_os = "windows")))]
 mod imp {
     use super::*;
@@ -281,7 +288,7 @@ mod imp {
                         continue;
                     }
                 };
-                if identity.as_slice() != recipient_peer_id {
+                if identity.as_slice() != &recipient_peer_id[..] {
                     let _ = peripheral.disconnect().await;
                     continue;
                 }
