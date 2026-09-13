@@ -5,24 +5,38 @@ use echomesh_core::protocol::ECHO_SERVICE_PEER_ID;
 use echomesh_core::EchoMeshClient;
 use crate::state::{AppState, MessageDto, TauriEventsListener};
 
-async fn ensure_client(app_handle: &AppHandle, state: &State<'_, AppState>) -> Result<Arc<EchoMeshClient>, String> {
-    let mut client_guard = state.client.write().await;
-    if client_guard.is_none() {
-        let storage_str = state.storage_path.to_string_lossy().to_string();
-        let status_ref = Arc::new(std::sync::atomic::AtomicU8::new(0));
+pub(crate) async fn ensure_client(
+    app_handle: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<Arc<EchoMeshClient>, String> {
+    let client = {
+        let mut client_guard = state.client.write().await;
+        if client_guard.is_none() {
+            let storage_str = state.storage_path.to_string_lossy().to_string();
+            let status_ref = Arc::new(std::sync::atomic::AtomicU8::new(0));
 
-        let listener = Box::new(TauriEventsListener {
-            app_handle: app_handle.clone(),
-            status_ref,
-        });
+            let listener = Box::new(TauriEventsListener {
+                app_handle: app_handle.clone(),
+                status_ref,
+            });
 
-        let client = EchoMeshClient::new(storage_str, listener)
-            .map_err(|e| format!("Failed to create EchoMeshClient: {:?}", e))?;
-        *client_guard = Some(client.clone());
-        Ok(client)
-    } else {
-        Ok(client_guard.as_ref().unwrap().clone())
+            let client = EchoMeshClient::new(storage_str, listener)
+                .map_err(|e| format!("Failed to create EchoMeshClient: {:?}", e))?;
+            *client_guard = Some(client.clone());
+            client
+        } else {
+            client_guard.as_ref().unwrap().clone()
+        }
+    };
+
+    // Bluetooth availability must never prevent relay/LAN use. Start it as a
+    // best-effort local bearer and keep the rest of the client usable when the
+    // adapter is disabled or absent.
+    if let Err(error) = state.ensure_ble(client.clone()).await {
+        tracing::debug!(%error, "native BLE bearer unavailable");
     }
+
+    Ok(client)
 }
 
 #[tauri::command]
