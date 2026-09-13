@@ -5,7 +5,7 @@ use echomesh_core::protocol::ECHO_SERVICE_PEER_ID;
 use echomesh_core::EchoMeshClient;
 use crate::state::{AppState, MessageDto, TauriEventsListener};
 
-async fn ensure_client(
+pub(crate) async fn ensure_client(
     app_handle: &AppHandle,
     state: &State<'_, AppState>,
 ) -> Result<Arc<EchoMeshClient>, String> {
